@@ -1,0 +1,40 @@
+{
+  "name": "pi-blips",
+  "version": "0.1.0",
+  "description": "Hear your coding agent think: a blip per streamed token, with a distinct timbre per channel",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "coding-agent",
+    "sonification",
+    "audio",
+    "web-audio",
+    "accessibility"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.mjs\"",
+    "demo": "node tools/render-demo.mjs",
+    "art": "node tools/ascii-envelope.mjs"
+  },
+  "dependencies": {
+    "node-web-audio-api": "^2.2.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ]
+}
