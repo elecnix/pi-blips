@@ -16,10 +16,13 @@ import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { BlipEngine, type Mode } from "./engine.ts";
+import { BlipEngine, type Mode, type WaitPersonality } from "./engine.ts";
+import { createWaitTracker } from "./wait.ts";
 
 const CONFIG_PATH = process.env.PI_BLIPS_CONFIG ?? join(homedir(), ".config", "pi-blips.json");
 const DENSITY_TICK_MS = 80;
+/** The wait heartbeat: one beat per second, as slow as a resting pulse. */
+const BEAT_INTERVAL_MS = 1000;
 const RAW_LOG = process.env.PI_BLIPS_RAW;
 const EVENT_LOG = process.env.PI_BLIPS_LOG;
 /** Per-turn counters draw over the TUI input box, so they are opt-in. */
@@ -31,9 +34,11 @@ interface Config {
 	master: number;
 	/** Only make sound in the interactive TUI; stay silent in print/json/rpc runs. */
 	interactiveOnly: boolean;
+	/** Beat once a second while waiting on the provider or on a tool. */
+	waitBeats: boolean;
 }
 
-const DEFAULTS: Config = { enabled: true, mode: "discrete", master: 1, interactiveOnly: true };
+const DEFAULTS: Config = { enabled: true, mode: "discrete", master: 1, interactiveOnly: true, waitBeats: true };
 
 function warn(message: string) {
 	process.stderr.write(`[blips] ${message}\n`);
@@ -61,6 +66,17 @@ export default function (pi: ExtensionAPI) {
 	let ctx: import("node-web-audio-api").AudioContext | undefined;
 	let engine: BlipEngine | undefined;
 	let ticker: ReturnType<typeof setInterval> | undefined;
+	// Decides which kind of dead air we are in, and owns the anchored 1 Hz pulse.
+	// It only ever talks to the engine, and only in three verbs.
+	const waiter = createWaitTracker(
+		{
+			begin: (kind) => engine?.wait(kind),
+			beat: () => engine?.beat(),
+			end: () => engine?.wait(null),
+		},
+		() => config.waitBeats && config.enabled,
+		{ intervalMs: BEAT_INTERVAL_MS },
+	);
 
 	async function boot(mode: ExtensionContext["mode"]) {
 		if (ctx || !config.enabled) return;
@@ -88,6 +104,8 @@ export default function (pi: ExtensionAPI) {
 					}
 				}, DENSITY_TICK_MS);
 			}
+			// The heartbeat is armed by the wait tracker when a wait begins, so no
+			// free-running clock is needed here.
 		} catch (error) {
 			warn(`audio unavailable: ${String(error)}`);
 			ctx = undefined;
@@ -140,28 +158,42 @@ export default function (pi: ExtensionAPI) {
 	pi.on("message_update", (event) => {
 		const delta = event.assistantMessageEvent.type;
 		if (RAW_LOG) appendFileSync(RAW_LOG, `${delta} ${Date.now()}\n`);
+		// The first delta of any kind means the provider answered: stop beating.
+		if (delta.endsWith("_delta")) waiter.delta();
 		// Structural deltas are already covered by the turn/tool events below.
 		if (delta === "text_delta") engine?.note("text");
 		else if (delta === "thinking_delta") engine?.note("thinking");
 		else if (delta === "toolcall_delta") engine?.note("toolarg");
 	});
 
-	pi.on("tool_execution_start", () => engine?.note("toolcall"));
-	pi.on("tool_execution_end", (event) => engine?.note(event.isError ? "error" : "toolresult"));
-	pi.on("turn_end", () => engine?.note("turnend"));
+	pi.on("agent_start", () => waiter.agentStart());
+	pi.on("turn_start", () => waiter.turnStart());
+	pi.on("tool_execution_start", (event) => {
+		waiter.toolStart(event.toolCallId);
+		engine?.note("toolcall");
+	});
+	pi.on("tool_execution_end", (event) => {
+		waiter.toolEnd(event.toolCallId);
+		engine?.note(event.isError ? "error" : "toolresult");
+	});
+	pi.on("turn_end", () => {
+		waiter.turnEnd();
+		engine?.note("turnend");
+	});
 	pi.on("message_end", (event) => {
 		if (event.message.role !== "assistant") return;
 		const reason = (event.message as { stopReason?: string }).stopReason;
 		if (reason === "error" || reason === "aborted") engine?.note("error");
 	});
 	pi.on("agent_end", () => {
+		waiter.agentEnd();
 		if (!VERBOSE) return;
 		const stats = engine?.stats();
 		if (stats) warn(`turn done: ${engine?.rate(1).toFixed(1)} blips/s, dropped ${stats.dropped}`);
 	});
 
 	pi.registerCommand("blips", {
-		description: "Token-stream audio: on|off|mode <discrete|density>|volume <0-4>|test|status",
+		description: "Token-stream audio: on|off|mode <discrete|density>|volume <0-4>|wait <on|off>|test|status",
 		handler: async (args, cmdCtx: ExtensionContext) => {
 			const [sub, value] = args.trim().toLowerCase().split(/\s+/);
 			switch (sub) {
@@ -199,19 +231,31 @@ export default function (pi: ExtensionAPI) {
 						return;
 					}
 					const seconds = engine.test();
-					cmdCtx.ui.notify(`blips: playing all 7 voices over ${seconds.toFixed(1)}s`, "info");
+					cmdCtx.ui.notify(`blips: 7 voices, then the wait heartbeat, over ${seconds.toFixed(1)}s`, "info");
 					return;
+				}
+				case "wait": {
+					if (value !== "on" && value !== "off") {
+						cmdCtx.ui.notify("usage: /blips wait <on|off>", "warning");
+						return;
+					}
+					config = { ...config, waitBeats: value === "on" };
+					saveConfig(config);
+					if (value === "off") waiter.stop();
+					break;
 				}
 				default:
 					break;
 			}
 
+			const mode = `mode=${config.mode}, volume=${config.master}`;
+			const wait = config.waitBeats ? `wait=${waiter.state() ?? "idle"}` : "wait=off";
 			const state = !config.enabled
 				? "off"
 				: ctx
-					? `${ctx.state}, ${ctx.sampleRate} Hz, mode=${config.mode}, volume=${config.master}`
+					? `${ctx.state}, ${ctx.sampleRate} Hz, ${mode}, ${wait}`
 					: config.interactiveOnly
-						? `armed (TUI only), mode=${config.mode}`
+						? `armed (TUI only), ${mode}, ${wait}`
 						: "no device";
 			const stats = engine?.stats();
 			const tail = stats ? ` | fired ${Object.entries(stats.fired).map(([k, v]) => `${k}:${v}`).join(" ")} dropped ${stats.dropped}` : "";

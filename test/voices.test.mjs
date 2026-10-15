@@ -2,35 +2,36 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { OfflineAudioContext } from "node-web-audio-api";
 import { BlipEngine, VOICES } from "../extensions/pi-blips/engine.ts";
+import { peak, SR } from "./audio-helpers.mjs";
 
-const SR = 48_000;
-const VOICE_ORDER = ["text", "thinking", "toolarg", "toolcall", "toolresult", "turnend", "error"];
+const STREAMING = ["text", "thinking", "toolarg", "toolcall", "toolresult", "turnend", "error"];
+/** /blips test: the seven voices, then the heartbeat, high and low per personality. */
+const TEST_SEQUENCE = [...STREAMING, "waitmodel", "waitmodel", "waittool", "waittool"];
 
 // Regression guard for the bug that made this extension inaudible: blips at
 // 0.05 peak (-26 dBFS) cannot be heard over media on a sink below ~50% volume.
 test("voice peaks stay in the audible range and below clipping", () => {
-	for (const voice of VOICE_ORDER) {
+	for (const voice of [...STREAMING, "waitmodel", "waittool"]) {
 		const { gain } = VOICES[voice];
 		assert.ok(gain >= 0.1, `${voice} at ${gain} is too quiet to hear over media`);
 		assert.ok(gain <= 0.6, `${voice} at ${gain} risks clipping the mix bus`);
 	}
 });
 
-test("/blips test fires one blip per voice, in a fixed order", async () => {
-	const ctx = new OfflineAudioContext(1, SR * 4, SR);
+test("/blips test fires every voice in a fixed order, heartbeat last", async () => {
+	const ctx = new OfflineAudioContext(1, SR * 8, SR);
 	const engine = new BlipEngine(ctx, { mode: "discrete", master: 1 });
 	const fired = [];
 	engine.onEvent = (event) => fired.push(event.kind);
 
 	const seconds = engine.test(0.1);
-	// 7 voices, 0.4 s apart.
-	assert.ok(Math.abs(seconds - 2.8) < 1e-9, `expected 2.8s, got ${seconds}`);
+	assert.ok(seconds > 6 && seconds < 7, `expected about 6.4s, got ${seconds}`);
 	await ctx.startRendering();
-	assert.deepEqual(fired, VOICE_ORDER);
+	assert.deepEqual(fired, TEST_SEQUENCE);
 });
 
 test("every blip fades in instead of starting at full level", async () => {
-	const ctx = new OfflineAudioContext(1, SR * 4, SR);
+	const ctx = new OfflineAudioContext(1, SR * 8, SR);
 	const engine = new BlipEngine(ctx, { mode: "discrete", master: 1 });
 	const onsets = [];
 	engine.onEvent = (event) => onsets.push({ kind: event.kind, at: event.at });
@@ -47,12 +48,22 @@ test("every blip fades in instead of starting at full level", async () => {
 	}
 });
 
+test("the demo is loud enough to hear and does not clip", async () => {
+	const ctx = new OfflineAudioContext(1, SR * 8, SR);
+	const engine = new BlipEngine(ctx, { mode: "discrete", master: 1 });
+	engine.test(0.1);
+	const data = (await ctx.startRendering()).getChannelData(0);
+	const loudest = peak(data);
+	assert.ok(loudest > 0.2, `peak ${loudest.toFixed(3)} is too quiet to hear over media`);
+	assert.ok(loudest < 0.98, `peak ${loudest.toFixed(3)} clips`);
+});
+
 // Square and sawtooth edges are the timbre, so the smoothness check applies to
 // the continuous voices only; this is where an envelope bug would show up.
 test("continuous voices never step", async () => {
 	const ctx = new OfflineAudioContext(1, SR, SR);
 	const engine = new BlipEngine(ctx, { mode: "discrete", master: 1 });
-	for (const voice of ["text", "thinking", "turnend"]) engine.note(voice, 1, 0.02);
+	for (const voice of ["text", "thinking", "turnend", "waitmodel"]) engine.note(voice, 1, 0.02);
 	const data = (await ctx.startRendering()).getChannelData(0);
 
 	let maxStep = 0;

@@ -2,8 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { OfflineAudioContext } from "node-web-audio-api";
 import { BlipEngine } from "../extensions/pi-blips/engine.ts";
-
-const SR = 48_000;
+import { loudestFrequency, rms, SR } from "./audio-helpers.mjs";
 
 function renderRamp() {
 	const seconds = 3;
@@ -20,32 +19,6 @@ function renderRamp() {
 	}
 	return { ctx, engine, ticks, seconds };
 }
-
-const rms = (data, from, to) => {
-	let sum = 0;
-	for (let i = from * SR; i < to * SR; i++) sum += data[i] * data[i];
-	return Math.sqrt(sum / (to * SR - from * SR));
-};
-
-const loudestFrequency = (data, from, to) => {
-	let best = 0;
-	let bestMag = 0;
-	for (let f = 200; f < 1600; f += 10) {
-		let re = 0;
-		let im = 0;
-		for (let i = from * SR; i < to * SR; i++) {
-			const angle = (2 * Math.PI * f * i) / SR;
-			re += data[i] * Math.cos(angle);
-			im += data[i] * Math.sin(angle);
-		}
-		const mag = Math.hypot(re, im);
-		if (mag > bestMag) {
-			bestMag = mag;
-			best = f;
-		}
-	}
-	return best;
-};
 
 test("density mode aggregates a tick into one blip instead of dropping it", () => {
 	const { ctx, engine, ticks } = renderRamp();

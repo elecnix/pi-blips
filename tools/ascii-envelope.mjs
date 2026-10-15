@@ -1,5 +1,7 @@
 /**
- * The README art, generated from the real audio and the real voice table.
+ * The README art, generated from the real audio: one offline render of the
+ * `/blips test` sequence, drawn twice — as a timeline from the engine's own
+ * onset events, and as an envelope from the rendered samples.
  *
  *   npm run art
  */
@@ -7,32 +9,33 @@ import { OfflineAudioContext } from "node-web-audio-api";
 import { BlipEngine, VOICES } from "../extensions/pi-blips/engine.ts";
 
 const SR = 48_000;
+const BUCKET = 0.2; // seconds per column
 const RAMP = "▁▂▃▄▅▆▇█";
 
-// --- timeline: one row per voice, from the engine's own /blips test schedule.
-const VOICE_ORDER = ["text", "thinking", "toolarg", "toolcall", "toolresult", "turnend", "error"];
-const SPACING = 0.4;
-const START = 0.1;
-const COLUMNS = 56;
-const BUCKET = 0.05;
-
-console.log("voice        " + Array.from({ length: COLUMNS }, (_, i) => (i % 10 === 0 ? "|" : " ")).join(""));
-for (const [index, voice] of VOICE_ORDER.entries()) {
-	const at = START + index * SPACING;
-	const width = Math.max(1, Math.round(VOICES[voice].dur / BUCKET));
-	const cells = Array.from({ length: COLUMNS }, (_, i) => {
-		const columnTime = i * BUCKET;
-		return columnTime >= at - 1e-9 && columnTime < at + width * BUCKET ? "▓" : " ";
-	});
-	console.log(voice.padEnd(12) + cells.join(""));
-}
-console.log(`             ${SPACING.toFixed(1)}s apart, ticks are 0.5s`);
-
-// --- envelope: RMS of the rendered /blips test, as a sparkline.
-const ctx = new OfflineAudioContext(1, SR * 3, SR);
-new BlipEngine(ctx, { master: 1 }).test(START);
+const ctx = new OfflineAudioContext(1, SR * 8, SR);
+const engine = new BlipEngine(ctx, { master: 1 });
+const onsets = [];
+engine.onEvent = (event) => onsets.push({ voice: event.kind, at: event.at });
+const seconds = engine.test(0.1);
 const data = (await ctx.startRendering()).getChannelData(0);
 
+// --- timeline: rows in order of first appearance, each blip as wide as it sounds.
+const columns = Math.ceil((seconds + 0.2) / BUCKET);
+const rows = [...new Set(onsets.map((o) => o.voice))];
+const label = Math.max(...rows.map((r) => r.length)) + 2;
+
+console.log(" ".repeat(label) + Array.from({ length: columns }, (_, i) => (i % 5 === 0 ? "|" : " ")).join(""));
+for (const voice of rows) {
+	const marks = new Set();
+	for (const onset of onsets.filter((o) => o.voice === voice)) {
+		const width = Math.max(1, Math.round(VOICES[voice].dur / BUCKET));
+		for (let c = Math.floor(onset.at / BUCKET); c < Math.floor(onset.at / BUCKET) + width; c++) marks.add(c);
+	}
+	console.log(voice.padEnd(label) + Array.from({ length: columns }, (_, i) => (marks.has(i) ? "▓" : " ")).join(""));
+}
+console.log(`${" ".repeat(label)}one column = ${BUCKET}s, ticks are 1s, ${seconds.toFixed(1)}s total`);
+
+// --- envelope: RMS as a sparkline, so the shape above is provably the audio below.
 const buckets = 104;
 const per = Math.floor(data.length / buckets);
 const levels = [];
@@ -47,4 +50,4 @@ for (let b = 0; b < buckets; b++) {
 }
 const loudest = Math.max(...levels);
 console.log("\n" + levels.map((l) => (l < 1e-6 ? " " : RAMP[Math.min(7, Math.floor((l / loudest) * 8))])).join(""));
-console.log(`one column ≈ 30 ms · peak ${(20 * Math.log10(peak)).toFixed(1)} dBFS`);
+console.log(`one column ≈ ${Math.round((per / SR) * 1000)} ms · peak ${(20 * Math.log10(peak)).toFixed(1)} dBFS`);

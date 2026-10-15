@@ -12,25 +12,27 @@ error. You can hear when the model stops talking to itself and starts writing co
 hear a turn end without looking at the screen.
 
 ```
-voice        |         |         |         |         |         |     
-text          ▓                                                     
-thinking              ▓▓                                            
-toolarg                       ▓                                     
-toolcall                              ▓▓▓                           
-toolresult                                    ▓▓▓                   
-turnend                                               ▓▓▓▓          
-error                                                         ▓▓▓▓▓▓
-             0.4s apart, ticks are 0.5s
+            |    |    |    |    |    |    |
+text        ▓
+thinking      ▓
+toolarg         ▓
+toolcall          ▓
+toolresult          ▓
+turnend               ▓
+error                   ▓
+waitmodel                    ▓    ▓
+waittool                               ▓    ▓
+            one column = 0.2s, ticks are 1s, 6.4s total
 
-   ▄▃▁▁          ▃▂▁▁▁         ▁▁            ▇▂▁▁▁         ▇▂▁▁▁         ▇▃▁▁▁▁▁▁▁    ▁█▄▂▁▁▁▁▁▁▁▁      
-one column ≈ 30 ms · peak -10.4 dBFS
+ ▄▁   ▃▁▁  ▁▁    ▇▁   ▇▁   ▇▂▁▁ █▅▁▁▁        ▃▁           ▃▁           ▃▁           ▃▁
+one column ≈ 77 ms · peak -10.4 dBFS
 ```
 
 That is `/blips test`, rendered to audio and back into text by `npm run art`.
 
 ## Listen
 
-- [`assets/blips-test.mp3`](assets/blips-test.mp3) — all seven voices, one after another
+- [`assets/blips-test.mp3`](assets/blips-test.mp3) — all nine voices: the seven stream blips, then the wait heartbeat at its real 1 Hz cadence
 - [`assets/density-ramp.mp3`](assets/density-ramp.mp3) — density mode, with throughput climbing 5 → 100 tokens/s
 
 ## What you hear
@@ -44,6 +46,8 @@ That is `/blips test`, rendered to audio and back into text by `npm run art`.
 | `toolresult` | `tool_execution_end` | 900 → 450 Hz square chirp | 0.28 |
 | `turnend` | `turn_end` | 1050 → 790 Hz sine, 220 ms | 0.30 |
 | `error` | tool error, `stopReason` `error`/`aborted` | 170 Hz sawtooth grumble | 0.45 |
+| `waitmodel` | waiting on the provider | 520/390 Hz triangle pulse, 1 Hz | 0.16 |
+| `waittool` | waiting on a tool | 660/990 Hz square pulse, 1 Hz | 0.15 |
 
 ## Install
 
@@ -69,17 +73,18 @@ pleasant as it sounds. Reload with `/reload` after installing or editing; pi rea
 ## Commands
 
 ```
-/blips                       status: device, mode, volume, counters
+/blips                       status: device, mode, volume, heartbeat, counters
 /blips on | off
 /blips mode discrete|density
 /blips volume 0-4
-/blips test                  play all seven voices once, 2.8 s
+/blips wait on | off
+/blips test                  seven voices, then the heartbeat, 6.4 s
 ```
 
 Configuration is written to `~/.config/pi-blips.json`:
 
 ```json
-{ "enabled": true, "mode": "discrete", "master": 1, "interactiveOnly": true }
+{ "enabled": true, "mode": "discrete", "master": 1, "interactiveOnly": true, "waitBeats": true }
 ```
 
 `interactiveOnly` keeps print, JSON and RPC runs silent — a headless run should not make noise.
@@ -104,6 +109,39 @@ voice floors are the design, not a limitation:
 - **`density`** — a fixed 12.5 Hz clock. Each tick emits at most one aggregated blip per active streaming
   voice, with amplitude tracking the deltas since the last tick and pitch rising with throughput. In the
   ramp demo: RMS 0.0036 → 0.0071, dominant frequency 820 Hz → 1140 Hz.
+
+## Waiting has a personality
+
+The interesting part of a sonified agent is the silence: the seconds between submitting a prompt and the first
+token, and the seconds a tool spends working. Both are now audible as a heartbeat, one beat per second,
+alternating high and low — so a long wait has a pulse instead of a gap.
+
+The two kinds of dead air get two personalities, distinguishable with your eyes closed:
+
+| waiting on | voice | alternating | sounds like |
+|---|---|---|---|
+| the provider | falling triangle | 520 → 390 Hz | patient, a slow breath |
+| a tool | rising square | 660 → 990 Hz | brisk, something is churning |
+
+Details that make it behave:
+
+- The heartbeat **starts on the beat that matters**: entering a wait state beats immediately rather than up to a
+  second later, so you hear "tool started" as it happens. Redundant transitions (both `agent_start` and
+  `turn_start` fire for the same wait) do not re-beat, and never arm a second pulse.
+- The pulse is **anchored to the state change**, not run off a free clock. A free-running 1 Hz clock lands
+  wherever it happens to be when the state changes — measured once at 22 ms after the change beat — and that
+  pulse is then gated away as too close, leaving an audible hole. Anchored, the spacing inside one personality
+  is a steady 1.00 s (measured 1.003 s live), and a personality switch beats immediately.
+- Any streamed delta ends the wait — the provider answered. Tool calls are tracked as a **set**, because pi runs
+  them in parallel: the heartbeat returns to the provider personality only when the last one has returned.
+- Each personality owns its own voice, so switching between them is instant; but each has a **0.5 s floor**, so a
+  tool that returns immediately cannot machine-gun over the provider's pulse.
+- `agent_end` clears the pulse and leaves no pending timer, so an idle agent is genuinely silent — a tool
+  cancelling late cannot resurrect a heartbeat that would then run until the next event.
+- It rides the same mix bus as everything else, so `/blips volume` scales it, and `/blips wait off` disables it.
+
+The state machine lives in `extensions/pi-blips/wait.ts`, separated from both audio and pi's event wiring. Its
+clock is injectable, so the exact pulse schedule is tested with no device and no real time.
 
 ## The numbers that matter
 
@@ -132,7 +170,7 @@ far more frequent.
 ## Tests
 
 ```bash
-npm test     # 12 tests, no audio device required
+npm test     # 30 tests, no audio device required
 ```
 
 Every test drives an `OfflineAudioContext` or a stub device, never a real output stream, so the suite runs
@@ -143,6 +181,12 @@ unchanged on a headless CI runner. Coverage is behavioural rather than decorativ
   rises, and stays completely silent when idle
 - a device that disappears mid-session reports one error and then goes permanently quiet, instead of throwing
   once per token
+- the heartbeat is silent while nothing is pending, beats immediately on a state change without repeating,
+  alternates 520 → 390 Hz (verified by DFT on the rendered audio) at one beat per second, and is rate limited
+  against state flapping
+- the wait state machine is tested with a recording sink and a manual clock: parallel tools hold the tool
+  personality until the last one returns, redundant transitions neither re-beat nor arm a second pulse, the
+  pulse is exactly 1 Hz within a personality and re-anchors on a switch, and `agent_end` leaves no pending timer
 - voice peaks stay audible and below clipping; every blip fades in rather than starting at full level;
   continuous voices never step
 

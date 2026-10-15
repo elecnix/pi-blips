@@ -9,12 +9,28 @@
  */
 import type { BaseAudioContext } from "node-web-audio-api";
 
-export type Voice = "text" | "thinking" | "toolarg" | "toolcall" | "toolresult" | "turnend" | "error";
+export type Voice =
+	| "text"
+	| "thinking"
+	| "toolarg"
+	| "toolcall"
+	| "toolresult"
+	| "turnend"
+	| "error"
+	| "waitmodel"
+	| "waittool";
 export type Mode = "discrete" | "density";
+/** What the agent is blocked on, which decides the heartbeat's personality. */
+export type WaitPersonality = "model" | "tool";
+
+/** The voice each wait personality beats with. */
+export const WAIT_VOICE: Record<WaitPersonality, Voice> = { model: "waitmodel", tool: "waittool" };
 
 interface VoiceSpec {
 	wave: OscillatorType;
 	freq: number;
+	/** Pitch used on every second beat, for voices that alternate (the heartbeats). */
+	alt?: number;
 	/** Random detune range in Hz, so a stream of blips does not sound mechanical. */
 	spread?: number;
 	dur: number;
@@ -38,6 +54,13 @@ export const VOICES: Record<Voice, VoiceSpec> = {
 	toolresult: { wave: "square", freq: 900, dur: 0.09, gain: 0.28, glide: 0.5 },
 	turnend: { wave: "sine", freq: 1050, dur: 0.22, gain: 0.3, glide: 0.75 },
 	error: { wave: "sawtooth", freq: 170, dur: 0.28, gain: 0.45 },
+	// Waiting, at one beat per second, alternating high/low. Two personalities so
+	// the two kinds of dead air are distinguishable with your eyes closed: a
+	// patient falling triangle while the provider thinks, a bright rising square
+	// while a tool runs. The 0.5 s floor absorbs state flapping (a tool that
+	// returns instantly must not re-beat over the model's heartbeat).
+	waitmodel: { wave: "triangle", freq: 520, alt: 390, dur: 0.08, gain: 0.16, minGap: 0.5 },
+	waittool: { wave: "square", freq: 660, alt: 990, dur: 0.045, gain: 0.15, minGap: 0.5 },
 };
 
 /** Voices that stream too fast to be discrete and get aggregated in density mode. */
@@ -53,6 +76,8 @@ interface FireOptions {
 	when?: number;
 	gain?: number;
 	detune?: number;
+	/** Absolute frequency, used by the alternating heartbeats. Skips detune. */
+	pitch?: number;
 	density?: boolean;
 	bypassGate?: boolean;
 	weight?: number;
@@ -76,6 +101,9 @@ export class BlipEngine {
 	private suppressed = 0;
 	/** Set when the audio backend throws, so a lost device cannot spam errors per delta. */
 	private dead = false;
+	/** Current wait state, or null when the agent is not blocked on anything. */
+	private waiting: WaitPersonality | null = null;
+	private beatParity = 0;
 	mode: Mode;
 	onEvent?: (event: BlipEvent) => void;
 	onError?: (error: unknown) => void;
@@ -136,11 +164,52 @@ export class BlipEngine {
 		}
 	}
 
-	/** One of each voice, spaced out, so a human can confirm what they are hearing. */
+	/**
+	 * The `/blips test` sequence: one of each streaming and structural voice, then
+	 * the wait heartbeat at its real 1 Hz cadence, high and low per personality.
+	 */
 	test(now = this.ctx.currentTime + 0.1) {
 		const order: Voice[] = ["text", "thinking", "toolarg", "toolcall", "toolresult", "turnend", "error"];
 		order.forEach((voice, i) => this.safeFire(voice, { when: now + i * 0.4, bypassGate: true }));
-		return order.length * 0.4;
+
+		let at = now + order.length * 0.4 + 0.6;
+		for (const kind of ["model", "tool"] as WaitPersonality[]) {
+			for (let parity = 0; parity < 2; parity++) {
+				this.fireBeat(kind, parity, at);
+				at += 1;
+			}
+		}
+		return at - now - 1;
+	}
+
+	/** Which wait state is currently heartbeating, if any. */
+	waitState() {
+		return this.waiting;
+	}
+
+	/**
+	 * Enter or leave a wait state: "model" while the provider is being asked,
+	 * "tool" while tools run. Each wait starts on the high pitch and beats
+	 * immediately, so a change of state is audible without waiting for the clock.
+	 */
+	wait(kind: WaitPersonality | null, when?: number) {
+		if (this.waiting === kind) return;
+		this.waiting = kind;
+		this.beatParity = 0;
+		if (kind) this.fireBeat(kind, this.beatParity++, when);
+	}
+
+	/** One beat of the wait heartbeat; a no-op when nothing is pending. */
+	beat(when?: number) {
+		if (!this.waiting) return;
+		this.fireBeat(this.waiting, this.beatParity++, when);
+	}
+
+	/** One beat, stepping between the spec's two pitches. */
+	private fireBeat(kind: WaitPersonality, parity: number, when?: number) {
+		const voice = WAIT_VOICE[kind];
+		const spec = VOICES[voice];
+		this.safeFire(voice, { when, pitch: parity % 2 === 1 ? (spec.alt ?? spec.freq) : spec.freq });
 	}
 
 	/** Blips per second over the last `window` seconds. */
@@ -186,7 +255,8 @@ export class BlipEngine {
 
 		const shape = opts.density && spec.density ? spec.density : spec;
 		const detune = opts.detune ?? 1;
-		const freq = spec.freq * detune * (1 + ((Math.random() - 0.5) * (spec.spread ?? 0)) / spec.freq);
+		// The heartbeats step between two fixed pitches, so they skip the detune.
+		const freq = opts.pitch ?? spec.freq * detune * (1 + ((Math.random() - 0.5) * (spec.spread ?? 0)) / spec.freq);
 
 		const osc = this.ctx.createOscillator();
 		osc.type = spec.wave;

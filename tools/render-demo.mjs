@@ -57,7 +57,7 @@ async function render(seconds, fill) {
 }
 
 // 1. Every voice once, in order: what /blips test plays.
-const demo = await render(3.2, (engine) => engine.test(0.2));
+const demo = await render(7, (engine) => engine.test(0.2));
 writeWav("blips-test.wav", demo.data);
 console.log(`  peak ${demo.peak.toFixed(3)} (${(20 * Math.log10(demo.peak)).toFixed(1)} dBFS)`);
 
