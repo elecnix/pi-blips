@@ -10,17 +10,19 @@
  *
  * Every event handler here is synchronous. pi awaits `message_update` handlers
  * in stream order, so a handler that awaits or spawns a process would stall the
- * token stream. Scheduling a Web Audio node is a synchronous, O(1) call.
+ * token stream. The audio itself lives in a worker (see host.ts and worker.ts),
+ * so even a wedged audio call cannot stall a handler.
  */
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { Worker } from "node:worker_threads";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { BlipEngine, type Mode, type WaitPersonality } from "./engine.ts";
+import type { Mode } from "./engine.ts";
+import { BlipHost } from "./host.ts";
 import { createWaitTracker } from "./wait.ts";
 
 const CONFIG_PATH = process.env.PI_BLIPS_CONFIG ?? join(homedir(), ".config", "pi-blips.json");
-const DENSITY_TICK_MS = 80;
 /** The wait heartbeat: one beat per second, as slow as a resting pulse. */
 const BEAT_INTERVAL_MS = 1000;
 const RAW_LOG = process.env.PI_BLIPS_RAW;
@@ -63,95 +65,55 @@ function saveConfig(config: Config) {
 
 export default function (pi: ExtensionAPI) {
 	let config = loadConfig();
-	let ctx: import("node-web-audio-api").AudioContext | undefined;
-	let engine: BlipEngine | undefined;
-	let ticker: ReturnType<typeof setInterval> | undefined;
+	let host: BlipHost | undefined;
 	// Decides which kind of dead air we are in, and owns the anchored 1 Hz pulse.
-	// It only ever talks to the engine, and only in three verbs.
+	// It only ever talks to the audio worker, and only in three verbs.
 	const waiter = createWaitTracker(
 		{
-			begin: (kind) => engine?.wait(kind),
-			beat: () => engine?.beat(),
-			end: () => engine?.wait(null),
+			begin: (kind) => host?.wait(kind),
+			beat: () => host?.beat(),
+			end: () => host?.wait(null),
 		},
 		() => config.waitBeats && config.enabled,
 		{ intervalMs: BEAT_INTERVAL_MS },
 	);
 
-	async function boot(mode: ExtensionContext["mode"]) {
-		if (ctx || !config.enabled) return;
+	function boot(mode: ExtensionContext["mode"]) {
+		if (host || !config.enabled) return;
 		if (config.interactiveOnly && mode !== "tui") return;
 		try {
-			// Lazy so a missing/broken audio backend cannot break extension loading.
-			const { AudioContext } = await import("node-web-audio-api");
-			ctx = new AudioContext();
-			engine = new BlipEngine(ctx, {
-				master: config.master,
+			// The worker loads the audio backend lazily, so a missing or broken
+			// device cannot break extension loading.
+			host = new BlipHost({
+				createWorker: () => new Worker(new URL("./worker.ts", import.meta.url), { type: "module" }) as unknown as import("./host.ts").AudioWorker,
 				mode: config.mode,
-				onEvent: EVENT_LOG ? (event) => appendFileSync(EVENT_LOG, `${event.kind} ${event.at.toFixed(3)} ${event.weight ?? 1}\n`) : undefined,
-				onError: (error) => {
+				master: config.master,
+				log: EVENT_LOG,
+				onFatal: (error) => {
 					warn(`audio device lost, blips disabled: ${String(error)}`);
-					void shutdown();
+					shutdown();
 				},
 			});
-			if (config.mode === "density") {
-				ticker = setInterval(() => {
-					try {
-						engine?.flush();
-					} catch (error) {
-						warn(`density clock stopped: ${String(error)}`);
-						stopTicker();
-					}
-				}, DENSITY_TICK_MS);
-			}
-			// The heartbeat is armed by the wait tracker when a wait begins, so no
-			// free-running clock is needed here.
+			host.start();
 		} catch (error) {
 			warn(`audio unavailable: ${String(error)}`);
-			ctx = undefined;
-			engine = undefined;
+			host = undefined;
 		}
 	}
 
-	function stopTicker() {
-		if (ticker) clearInterval(ticker);
-		ticker = undefined;
-	}
-
-	async function shutdown() {
-		stopTicker();
-		const doomed = ctx;
-		ctx = undefined;
-		engine = undefined;
-		try {
-			await doomed?.close();
-		} catch {
-			/* closing an already-dead context is not worth reporting */
-		}
+	function shutdown() {
+		host?.close();
+		host = undefined;
 	}
 
 	function applyMode(mode: Mode) {
 		config = { ...config, mode };
 		saveConfig(config);
-		engine?.flush();
-		stopTicker();
-		if (engine) {
-			engine.mode = mode;
-			if (mode === "density") {
-				ticker = setInterval(() => {
-					try {
-						engine?.flush();
-					} catch (error) {
-						warn(`density clock stopped: ${String(error)}`);
-						stopTicker();
-					}
-				}, DENSITY_TICK_MS);
-			}
-		}
+		host?.setMode(mode);
 	}
 
 	pi.on("session_start", (_event, sessionCtx) => {
-		void boot(sessionCtx.mode);
+		boot(sessionCtx.mode);
 	});
 	pi.on("session_shutdown", () => shutdown());
 
@@ -161,35 +123,34 @@ export default function (pi: ExtensionAPI) {
 		// The first delta of any kind means the provider answered: stop beating.
 		if (delta.endsWith("_delta")) waiter.delta();
 		// Structural deltas are already covered by the turn/tool events below.
-		if (delta === "text_delta") engine?.note("text");
-		else if (delta === "thinking_delta") engine?.note("thinking");
-		else if (delta === "toolcall_delta") engine?.note("toolarg");
+		if (delta === "text_delta") host?.note("text");
+		else if (delta === "thinking_delta") host?.note("thinking");
+		else if (delta === "toolcall_delta") host?.note("toolarg");
 	});
 
 	pi.on("agent_start", () => waiter.agentStart());
 	pi.on("turn_start", () => waiter.turnStart());
 	pi.on("tool_execution_start", (event) => {
 		waiter.toolStart(event.toolCallId);
-		engine?.note("toolcall");
+		host?.note("toolcall");
 	});
 	pi.on("tool_execution_end", (event) => {
 		waiter.toolEnd(event.toolCallId);
-		engine?.note(event.isError ? "error" : "toolresult");
+		host?.note(event.isError ? "error" : "toolresult");
 	});
 	pi.on("turn_end", () => {
 		waiter.turnEnd();
-		engine?.note("turnend");
+		host?.note("turnend");
 	});
 	pi.on("message_end", (event) => {
 		if (event.message.role !== "assistant") return;
 		const reason = (event.message as { stopReason?: string }).stopReason;
-		if (reason === "error" || reason === "aborted") engine?.note("error");
+		if (reason === "error" || reason === "aborted") host?.note("error");
 	});
 	pi.on("agent_end", () => {
 		waiter.agentEnd();
 		if (!VERBOSE) return;
-		const stats = engine?.stats();
-		if (stats) warn(`turn done: ${engine?.rate(1).toFixed(1)} blips/s, dropped ${stats.dropped}`);
+		warn(`turn done${host ? `, ${host.restartsSoFar()} worker restart(s)` : ""}`);
 	});
 
 	pi.registerCommand("blips", {
@@ -200,12 +161,12 @@ export default function (pi: ExtensionAPI) {
 				case "on":
 					config = { ...config, enabled: true };
 					saveConfig(config);
-					await boot(cmdCtx.mode);
+					boot(cmdCtx.mode);
 					break;
 				case "off":
 					config = { ...config, enabled: false };
 					saveConfig(config);
-					await shutdown();
+					shutdown();
 					break;
 				case "mode":
 					if (value !== "discrete" && value !== "density") {
@@ -222,16 +183,16 @@ export default function (pi: ExtensionAPI) {
 					}
 					config = { ...config, master: level };
 					saveConfig(config);
-					engine?.setMaster(level);
+					host?.setMaster(level);
 					break;
 				}
 				case "test": {
-					if (!engine) {
+					if (!host?.alive()) {
 						cmdCtx.ui.notify("blips: no audio device (see stderr)", "warning");
 						return;
 					}
-					const seconds = engine.test();
-					cmdCtx.ui.notify(`blips: 7 voices, then the wait heartbeat, over ${seconds.toFixed(1)}s`, "info");
+					host.test();
+					cmdCtx.ui.notify("blips: 7 voices, then the wait heartbeat, over ~5.5s", "info");
 					return;
 				}
 				case "wait": {
@@ -252,14 +213,12 @@ export default function (pi: ExtensionAPI) {
 			const wait = config.waitBeats ? `wait=${waiter.state() ?? "idle"}` : "wait=off";
 			const state = !config.enabled
 				? "off"
-				: ctx
-					? `${ctx.state}, ${ctx.sampleRate} Hz, ${mode}, ${wait}`
+				: host?.alive()
+					? `worker alive (${host.restartsSoFar()} restart${host.restartsSoFar() === 1 ? "" : "s"}), ${mode}, ${wait}`
 					: config.interactiveOnly
 						? `armed (TUI only), ${mode}, ${wait}`
 						: "no device";
-			const stats = engine?.stats();
-			const tail = stats ? ` | fired ${Object.entries(stats.fired).map(([k, v]) => `${k}:${v}`).join(" ")} dropped ${stats.dropped}` : "";
-			cmdCtx.ui.notify(`blips: ${state}${tail}`, "info");
+			cmdCtx.ui.notify(`blips: ${state}`, "info");
 		},
 	});
 }
