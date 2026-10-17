@@ -143,19 +143,29 @@ Details that make it behave:
 The state machine lives in `extensions/pi-blips/wait.ts`, separated from both audio and pi's event wiring. Its
 clock is injectable, so the exact pulse schedule is tested with no device and no real time.
 
+## The audio runs in a worker
+
+`node-web-audio-api` sends every graph mutation — creating a node, connecting it, setting a parameter, calling
+`start()` — over a bounded 256-slot control channel whose only drainer is the audio device callback. One blip
+is about ten such messages, so when the sound card stops calling back the queue fills and the next blip blocks
+its caller inside the addon, with no timeout (see
+[#2](https://github.com/elecnix/pi-blips/issues/2)). On pi's main thread that call froze the agent loop and the
+TUI with it.
+
+The context, the engine and the density clock therefore live in a `worker_thread` (`worker.ts`), and the
+extension only posts messages to it (`host.ts`). The token path never touches the native module, so no audio
+call — however badly it behaves — can stall a stream or a repaint. If the worker does wedge, a watchdog notices
+that it stopped answering, terminates it and starts a fresh context, so audio recovers when the device does. A
+device that reports itself dead is not restarted into, because the failure is not the worker's.
+
 ## The numbers that matter
 
 `pi` awaits `message_update` handlers *in stream order*, so anything that blocks in the handler delays token
-consumption — a subprocess per token would fork 100 times a second. This extension only schedules Web Audio
-nodes, which is a synchronous, O(1) call into the audio thread:
-
-| case | cost |
-|---|---|
-| delta dropped by the rate gate (the common case) | **0.6 µs** |
-| delta that actually sounds | **0.2-0.7 ms** |
-| density mode | **0.4 µs** per delta + 12.5 flushes/s |
-
-At the ≤22 blips/s the text floor allows, that is well under 1% of one core.
+consumption — a subprocess per token would fork 100 times a second. Now a handler only posts a message to the
+audio worker: the per-voice rate gate and the node scheduling happen off the main thread, where a slow Web Audio
+call costs a blip rather than a token. The old synchronous path measured **0.6 µs** for a delta dropped by the
+gate, **0.2-0.7 ms** for one that sounded, and **0.4 µs** per delta in density mode plus 12.5 flushes/s; that
+work is now the worker's.
 
 ## Levels, or: the bug that made this inaudible
 
@@ -170,7 +180,7 @@ far more frequent.
 ## Tests
 
 ```bash
-npm test     # 30 tests, no audio device required
+npm test     # 39 tests, no audio device required
 ```
 
 Every test drives an `OfflineAudioContext` or a stub device, never a real output stream, so the suite runs
@@ -187,6 +197,9 @@ unchanged on a headless CI runner. Coverage is behavioural rather than decorativ
 - the wait state machine is tested with a recording sink and a manual clock: parallel tools hold the tool
   personality until the last one returns, redundant transitions neither re-beat nor arm a second pulse, the
   pulse is exactly 1 Hz within a personality and re-anchors on a switch, and `agent_end` leaves no pending timer
+- audio runs in a worker: a wedged worker is terminated and replaced, blips are dropped once it goes quiet
+  instead of piling up in its inbox, a reported-dead device is not restarted into, and the watchdog gives up
+  after a bounded number of wedges
 - voice peaks stay audible and below clipping; every blip fades in rather than starting at full level;
   continuous voices never step
 
@@ -196,8 +209,9 @@ Requires Node ≥ 22.19 (the engine is TypeScript, imported directly, so tests n
 
 - **Output follows the system default sink.** If it is muted, nothing is audible: check `wpctl status` (Linux)
   and unmute. There is no sink selection: whatever the default is, that is where blips go.
-- If the backend dies mid-session (device unplugged, sink removed), the engine reports one error, goes silent
-  and closes the context. `/blips status` then shows `no device` and `/blips on` rebuilds it.
+- If the audio backend stops calling back, the worker wedges; the watchdog terminates and replaces it, so the
+  session keeps running and audio comes back when the device does. If it wedges repeatedly the host gives up
+  (after five replacements) and blips go silent; `/blips on` starts it again.
 - `PI_BLIPS_VERBOSE=1` prints a per-turn counter line to stderr. It is off by default because stderr draws
   over the TUI input box; `/blips` shows the same counters on demand.
 - `PI_BLIPS_LOG` appends `kind audio-clock-time weight` per blip, for debugging.
